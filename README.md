@@ -18,6 +18,8 @@ RM_Gimbal_System_26 是一个面向 RoboMaster 云台视觉跟踪任务的工程
 
 ## 工程结构
 
+```text
+.
 ├── CMakeLists.txt
 ├── main.cpp                         # 主程序：信标检测、调试显示、串口发送
 ├── config/
@@ -41,7 +43,7 @@ RM_Gimbal_System_26 是一个面向 RoboMaster 云台视觉跟踪任务的工程
     ├── Calibrator.cpp               # 相机标定工具
     ├── GimbalDirectionTest.cpp      # 云台方向/协议探测工具
     └── SerialLoopbackTest.cpp       # USB-TTL 回环测试工具
-
+```
 
 ## 环境依赖
 
