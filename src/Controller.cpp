@@ -2,6 +2,7 @@
 
 #include <opencv2/highgui.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <utility>
@@ -141,8 +142,12 @@ TrackingState GimbalController::state() const noexcept {
 GimbalCommand GimbalController::makeCommand(const PoseResult& pose) const {
     GimbalCommand command;
     command.control = true;
-    command.yaw_deg = static_cast<float>(pose.yaw_deg * config_.yaw_kp);
-    command.pitch_deg = static_cast<float>(pose.pitch_deg * config_.pitch_kp);
+    command.yaw_deg = std::clamp(static_cast<float>(-1.0*pose.yaw_deg * config_.yaw_kp),
+                                 -config_.max_command_deg,
+                                 config_.max_command_deg);
+    command.pitch_deg = std::clamp(static_cast<float>(pose.pitch_deg * config_.pitch_kp),
+                                   -config_.max_command_deg,
+                                   config_.max_command_deg);
     command.distance_m = static_cast<float>(pose.distance_m);
     command.fire = shouldFire(pose);
     return command;

@@ -25,6 +25,7 @@ struct ControllerConfig {
     double fire_pitch_tolerance_deg{1.0};
     double yaw_kp{1.0};
     double pitch_kp{1.0};
+    float max_command_deg{20.0F};
     std::size_t lost_frame_threshold{5};
     std::size_t search_frame_threshold{30};
     float search_yaw_deg{8.0F};

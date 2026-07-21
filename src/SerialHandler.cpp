@@ -5,7 +5,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -14,7 +13,6 @@
 namespace rm_gimbal {
 namespace {
 
-constexpr double kDegToRad = 3.14159265358979323846 / 180.0;
 constexpr std::array<std::uint8_t, 2> kFrameHead{0x5A, 0xA5};
 
 // 电控给出的云台 -> 视觉协议。
@@ -64,10 +62,6 @@ speed_t baudRateToTermios(int baud_rate) {
         default:
             return B115200;
     }
-}
-
-float degToRad(float deg) {
-    return static_cast<float>(static_cast<double>(deg) * kDegToRad);
 }
 
 bool hasValidHeader(const std::uint8_t* data) {
@@ -186,9 +180,9 @@ bool SerialHandler::isOpened() const noexcept {
     return fd_ >= 0;
 }
 
-// 发送 VisionToGimbal v2.0：
-// [5A A5] [mode] [yaw/yaw_vel/yaw_acc/pitch/pitch_vel/pitch_acc(float)] [7F FE]
-// 协议要求 yaw/pitch 使用弧度制；Controller 内部仍用角度制，所以上串口前转换为 rad。
+// 发送 VisionToGimbal：
+// [5A A5] [mode] [yaw/yaw_vel/yaw_acc/pitch/pitch_vel/pitch_acc(float, deg)] [7F FE]
+// 电控协议约定 yaw/pitch 为角度制，Controller 内部同样使用角度制，所以这里直接发送 deg。
 bool SerialHandler::sendCommand(const GimbalCommand& command) {
     if (!isOpened()) {
         return false;
@@ -256,11 +250,11 @@ const SerialConfig& SerialHandler::config() const noexcept {
 
 std::vector<std::uint8_t> SerialHandler::packCommand(const GimbalCommand& command) const {
     VisionToGimbalPacket packet;
-    packet.mode = command.control ? (command.fire ? 2U : 1U) : 0U;
-    packet.yaw = command.control ? degToRad(command.yaw_deg) : 0.0F;
+    packet.mode = command.control ? (command.mode_override != 0 ? command.mode_override : (command.fire ? 2U : 1U)) : 0U;
+    packet.yaw = command.control ? command.yaw_deg : 0.0F;
     packet.yaw_vel = command.yaw_vel;
     packet.yaw_acc = command.yaw_acc;
-    packet.pitch = command.control ? degToRad(command.pitch_deg) : 0.0F;
+    packet.pitch = command.control ? command.pitch_deg : 0.0F;
     packet.pitch_vel = command.pitch_vel;
     packet.pitch_acc = command.pitch_acc;
 

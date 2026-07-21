@@ -3,6 +3,7 @@
 #include <string>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <optional>
 #include <opencv2/opencv.hpp>
 #include "Camera.hpp"
@@ -25,6 +26,22 @@ struct TrackbarState {
     int min_rectangularity_percent{45};
     int max_light_aspect_ratio_x10{45};
     int min_lights_per_beacon{2};
+    int yaw_kp_percent{100};
+    int pitch_kp_percent{100};
+    int max_cmd_deg{20};
+    int search_yaw_deg{8};
+};
+
+// 云台控制策略参数。现场联调时可以用滑条调整比例系数和限幅，避免目标突然跳变导致云台猛转。
+struct ControlStrategyConfig {
+    double yaw_kp{1.0};
+    double pitch_kp{1.0};
+    float max_cmd_deg{20.0F};
+    std::size_t lost_frame_threshold{5};
+    std::size_t search_frame_threshold{30};
+    float search_yaw_deg{8.0F};
+    double fire_yaw_tolerance_deg{1.0};
+    double fire_pitch_tolerance_deg{1.0};
 };
 
 // 主调试界面里的控制指令状态。这里只做显示，不发送串口，方便先验收视觉到控制量是否连续。
@@ -33,6 +50,13 @@ struct ControlDebugState {
     rm_gimbal::GimbalCommand command{};
     rm_gimbal::GimbalCommand last_command{};
     std::size_t lost_frames{0};
+};
+
+// 固定角度测试模式。用于把视觉链路和串口链路拆开验证：先发一个绝对 yaw/pitch，看云台是否响应。
+struct FixedTargetState {
+    bool enabled{false};
+    float yaw_deg{30.0F};
+    float pitch_deg{0.0F};
 };
 
 // 串口发送状态。主程序启动后默认不发送，现场按 u 后才打开串口并发送控制量。
@@ -101,6 +125,10 @@ void createControlWindow(TrackbarState& state) {
     cv::createTrackbar("rectangularity_%", kControlWindow, &state.min_rectangularity_percent, 100);
     cv::createTrackbar("max_aspect_x10", kControlWindow, &state.max_light_aspect_ratio_x10, 100);
     cv::createTrackbar("min_lights", kControlWindow, &state.min_lights_per_beacon, 10);
+    cv::createTrackbar("yaw_kp_%", kControlWindow, &state.yaw_kp_percent, 300);
+    cv::createTrackbar("pitch_kp_%", kControlWindow, &state.pitch_kp_percent, 300);
+    cv::createTrackbar("max_cmd_deg", kControlWindow, &state.max_cmd_deg, 60);
+    cv::createTrackbar("search_yaw_deg", kControlWindow, &state.search_yaw_deg, 30);
 }
 
 // 把当前检测参数格式化成一行文字，叠加显示在主画面左上角。
@@ -116,36 +144,69 @@ std::string configText(const rm_gimbal::DetectorConfig& config) {
     return text.str();
 }
 
-// 根据稳定后的 PnP 结果生成控制调试量。当前只显示，不写串口。
-rm_gimbal::GimbalCommand makeDebugCommand(const rm_gimbal::PoseResult& pose) {
+// 将滑条值转换为云台控制参数。比例系数控制跟随力度，限幅负责保护云台动作幅度。
+ControlStrategyConfig makeControlConfig(const TrackbarState& state) {
+    ControlStrategyConfig config;
+    config.yaw_kp = std::max(0, state.yaw_kp_percent) / 100.0;
+    config.pitch_kp = std::max(0, state.pitch_kp_percent) / 100.0;
+    config.max_cmd_deg = static_cast<float>(std::max(1, state.max_cmd_deg));
+    config.search_yaw_deg = static_cast<float>(std::max(1, state.search_yaw_deg));
+    return config;
+}
+
+float clampCommand(float value, float limit) {
+    return std::clamp(value, -limit, limit);
+}
+
+// 根据稳定后的 PnP 结果生成 yaw/pitch 控制量。串口开启后，这个结构体会被打包发送给下位机。
+// 当前下位机 yaw 正方向与相机解算方向相反，所以发送前把 yaw 取反。
+rm_gimbal::GimbalCommand makeDebugCommand(const rm_gimbal::PoseResult& pose,
+                                          const ControlStrategyConfig& config) {
     rm_gimbal::GimbalCommand command;
     command.control = true;
-    command.yaw_deg = static_cast<float>(pose.yaw_deg);
-    command.pitch_deg = static_cast<float>(pose.pitch_deg);
+    command.yaw_deg = clampCommand(static_cast<float>(-pose.yaw_deg * config.yaw_kp), config.max_cmd_deg);
+    command.pitch_deg = clampCommand(static_cast<float>(pose.pitch_deg * config.pitch_kp), config.max_cmd_deg);
     command.distance_m = static_cast<float>(pose.distance_m);
 
     // 目标接近中心时置 fire=true，这里表示“已基本对准”，不代表一定真实开火。
-    command.fire = std::abs(pose.yaw_deg) <= 1.0 && std::abs(pose.pitch_deg) <= 1.0;
+    command.fire = std::abs(pose.yaw_deg) <= config.fire_yaw_tolerance_deg &&
+                   std::abs(pose.pitch_deg) <= config.fire_pitch_tolerance_deg;
+    return command;
+}
+
+rm_gimbal::GimbalCommand makeFixedTargetCommand(const FixedTargetState& fixed_target) {
+    rm_gimbal::GimbalCommand command;
+    command.control = true;
+    command.mode_override = 2;
+    command.yaw_deg = fixed_target.yaw_deg;
+    command.pitch_deg = fixed_target.pitch_deg;
     return command;
 }
 
 // 简化版控制状态机：Tracking 正常输出；Lost 保留并衰减上一帧；Searching 输出小幅 yaw 扫描。
 void updateControlDebug(ControlDebugState& control,
-                        const std::optional<rm_gimbal::PoseResult>& pose) {
-    constexpr std::size_t kLostFrameThreshold = 5;
-    constexpr std::size_t kSearchFrameThreshold = 30;
-    constexpr float kSearchYawDeg = 8.0F;
+                        const std::optional<rm_gimbal::PoseResult>& pose,
+                        const ControlStrategyConfig& config,
+                        const FixedTargetState& fixed_target) {
+    if (fixed_target.enabled) {
+        control.state = rm_gimbal::TrackingState::Tracking;
+        control.lost_frames = 0;
+        control.command = makeFixedTargetCommand(fixed_target);
+        control.command.fire = false;
+        control.last_command = control.command;
+        return;
+    }
 
     if (pose.has_value()) {
         control.state = rm_gimbal::TrackingState::Tracking;
         control.lost_frames = 0;
-        control.command = makeDebugCommand(*pose);
+        control.command = makeDebugCommand(*pose, config);
         control.last_command = control.command;
         return;
     }
 
     ++control.lost_frames;
-    if (control.lost_frames <= kLostFrameThreshold) {
+    if (control.lost_frames <= config.lost_frame_threshold) {
         control.state = rm_gimbal::TrackingState::Lost;
         control.command = control.last_command;
         control.command.yaw_deg *= 0.8F;
@@ -156,15 +217,20 @@ void updateControlDebug(ControlDebugState& control,
     }
 
     control.state = rm_gimbal::TrackingState::Searching;
-    const float direction = (control.lost_frames / kSearchFrameThreshold) % 2 == 0 ? 1.0F : -1.0F;
+    const float direction = (control.lost_frames / config.search_frame_threshold) % 2 == 0 ? 1.0F : -1.0F;
     control.command = {};
     control.command.control = true;
-    control.command.yaw_deg = direction * kSearchYawDeg;
+    control.command.yaw_deg = direction * config.search_yaw_deg;
     control.command.fire = false;
 
-    if (control.lost_frames > kSearchFrameThreshold * 2) {
-        control.lost_frames = kLostFrameThreshold + 1;
+    if (control.lost_frames > config.search_frame_threshold * 2) {
+        control.lost_frames = config.lost_frame_threshold + 1;
     }
+}
+
+rm_gimbal::EnemyColor toggleEnemyColor(rm_gimbal::EnemyColor color) {
+    return color == rm_gimbal::EnemyColor::Red ? rm_gimbal::EnemyColor::Blue
+                                               : rm_gimbal::EnemyColor::Red;
 }
 
 // 读取相机标定文件。标定工具会输出 camera_matrix 和 distortion_coefficients。
@@ -213,7 +279,9 @@ cv::Mat makeDebugView(const cv::Mat& frame,
                       const std::optional<rm_gimbal::PoseResult>& pose,
                       const std::optional<rm_gimbal::CoordinateResult>& coordinates,
                       const ControlDebugState& control,
-                      const SerialDebugState& serial_state) {
+                      const SerialDebugState& serial_state,
+                      const ControlStrategyConfig& control_config,
+                      const FixedTargetState& fixed_target) {
     cv::Mat view = frame.clone();
 
     // 黄色框：当前识别到的单个信标发光矩形块。
@@ -253,7 +321,7 @@ cv::Mat makeDebugView(const cv::Mat& frame,
     const std::string status = "Target: " + colorName(enemy_color) +
                                " | lights: " + std::to_string(debug.lights.size()) +
                                " | beacons: " + std::to_string(debug.targets.size()) +
-                               " | keys: r/b switch, q quit";
+                               " | keys: c/r/b color, u serial, q quit";
     cv::putText(view, status, cv::Point(16, 32), cv::FONT_HERSHEY_SIMPLEX, 0.7,
                 cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
     cv::putText(view, status, cv::Point(16, 32), cv::FONT_HERSHEY_SIMPLEX, 0.7,
@@ -306,6 +374,21 @@ cv::Mat makeDebugView(const cv::Mat& frame,
                     cv::Scalar(120, 220, 255), 1, cv::LINE_AA);
     }
 
+    {
+        std::ostringstream strategy_text;
+        strategy_text.precision(2);
+        strategy_text << std::fixed
+                      << "kp yaw/pitch=" << control_config.yaw_kp << "/" << control_config.pitch_kp
+                      << " max_cmd=" << control_config.max_cmd_deg << "deg"
+                      << " search=" << control_config.search_yaw_deg << "deg"
+                      << " fixed=" << (fixed_target.enabled ? "ON" : "OFF")
+                      << " t=" << fixed_target.yaw_deg << "deg/" << fixed_target.pitch_deg << "deg";
+        cv::putText(view, strategy_text.str(), cv::Point(16, 182), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
+        cv::putText(view, strategy_text.str(), cv::Point(16, 182), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(180, 180, 255), 1, cv::LINE_AA);
+    }
+
     if (coordinates.has_value()) {
         std::ostringstream camera_text;
         std::ostringstream gimbal_text;
@@ -326,7 +409,7 @@ cv::Mat makeDebugView(const cv::Mat& frame,
 
         const std::array<std::string, 3> lines{camera_text.str(), gimbal_text.str(), world_text.str()};
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            const cv::Point pos(16, static_cast<int>(182 + i * 28));
+            const cv::Point pos(16, static_cast<int>(212 + i * 28));
             cv::putText(view, lines[i], pos, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
             cv::putText(view, lines[i], pos, cv::FONT_HERSHEY_SIMPLEX, 0.55,
@@ -358,6 +441,7 @@ int main(int argc, char** argv) {
     rm_gimbal::GimbalState gimbal_state;
     rm_gimbal::TargetTracker tracker;
     ControlDebugState control_debug;
+    FixedTargetState fixed_target;
 
     SerialDebugState serial_debug;
     if (argc >= 2) {
@@ -387,6 +471,7 @@ int main(int argc, char** argv) {
 
         // 2. 读取滑条参数并更新检测器。
         const auto config = makeDetectorConfig(trackbars, enemy_color);
+        const auto control_config = makeControlConfig(trackbars);
         detector.setConfig(config);
 
         // 3. 执行信标检测，同时拿到 mask、单灯块和最终信标目标。
@@ -410,8 +495,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        // 5. 由 PnP 结果生成控制调试量。本阶段只显示，不打开串口发送。
-        updateControlDebug(control_debug, pose);
+        // 5. 控制状态机：Tracking 跟踪，Lost 短时保持，Searching 丢失后小幅扫描。
+        updateControlDebug(control_debug, pose, control_config, fixed_target);
 
         // 6. 串口发送只在按 u 开启后执行。发送内容就是当前画面显示的 cmd_yaw/cmd_pitch。
         serial_debug.opened = serial.isOpened();
@@ -424,17 +509,24 @@ int main(int argc, char** argv) {
         // 7. 显示调试画面和二值化 mask。
         const cv::Mat debug_view = makeDebugView(frame, debug, enemy_color, config,
                                                  stable_target, tracker.lostFrames(),
-                                                 pose, coordinates, control_debug, serial_debug);
+                                                 pose, coordinates, control_debug, serial_debug,
+                                                 control_config, fixed_target);
 
         cv::imshow(kFrameWindow, debug_view);
         cv::imshow(kMaskWindow, debug.mask);
 
-        // 8. 键盘控制：红蓝切换、串口发送开关和退出。
+        // 8. 键盘控制：红蓝切换、串口发送开关、固定测试模式和退出。
         const int key = cv::waitKey(1);
         if (key == 'q' || key == 27) {
             break;
         }
-        if (key == 'r' || key == 'R') {
+        if (key == 'c' || key == 'C') {
+            enemy_color = toggleEnemyColor(enemy_color);
+            tracker.reset();
+            control_debug = {};
+            std::cout << "切换为" << (enemy_color == rm_gimbal::EnemyColor::Red ? "红色" : "蓝色")
+                      << "信标检测。" << std::endl;
+        } else if (key == 'r' || key == 'R') {
             enemy_color = rm_gimbal::EnemyColor::Red;
             tracker.reset();
             control_debug = {};
@@ -461,6 +553,12 @@ int main(int argc, char** argv) {
                 serial_debug.message = "serial off";
                 std::cout << "串口发送：关闭。" << std::endl;
             }
+        } else if (key == 't' || key == 'T') {
+            fixed_target.enabled = !fixed_target.enabled;
+            control_debug = {};
+            std::cout << "固定角度测试模式：" << (fixed_target.enabled ? "开启" : "关闭")
+                      << "，yaw=" << fixed_target.yaw_deg
+                      << " deg, pitch=" << fixed_target.pitch_deg << " deg" << std::endl;
         }
     }
 

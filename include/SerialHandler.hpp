@@ -23,6 +23,7 @@ struct SerialConfig {
 
 struct GimbalCommand {
     bool control{false};
+    std::uint8_t mode_override{0};
     float yaw_deg{0.0F};
     float yaw_vel{0.0F};
     float yaw_acc{0.0F};
