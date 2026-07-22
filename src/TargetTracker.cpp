@@ -50,9 +50,12 @@ std::optional<BeaconTarget> TargetTracker::update(const std::optional<BeaconTarg
     if (!measurement.has_value() || measurement->confidence < config_.min_confidence) {
         ++lost_frames_;
 
-        // 信标短暂漏检时继续输出上一帧目标，避免绿色框和 PnP 结果突然消失。
+        // 信标短暂漏检时用 Kalman 预测中心点，避免绿色框和 PnP 结果突然消失。
         if (tracked_target_.has_value() && lost_frames_ <= config_.max_lost_frames) {
             BeaconTarget held = *tracked_target_;
+            if (kalman_initialized_) {
+                held = withCenter(held, predictCenter());
+            }
             held.confidence *= 0.85;
             tracked_target_ = held;
             return tracked_target_;
@@ -64,7 +67,8 @@ std::optional<BeaconTarget> TargetTracker::update(const std::optional<BeaconTarg
 
     lost_frames_ = 0;
     if (!tracked_target_.has_value()) {
-        tracked_target_ = *measurement;
+        initializeKalman(measurement->center);
+        tracked_target_ = withCenter(*measurement, measurement->center);
         return tracked_target_;
     }
 
@@ -74,6 +78,7 @@ std::optional<BeaconTarget> TargetTracker::update(const std::optional<BeaconTarg
 
 void TargetTracker::reset() noexcept {
     tracked_target_.reset();
+    kalman_initialized_ = false;
     lost_frames_ = 0;
 }
 
@@ -89,14 +94,64 @@ const TargetTrackerConfig& TargetTracker::config() const noexcept {
     return config_;
 }
 
+void TargetTracker::initializeKalman(const cv::Point2f& center) {
+    center_filter_ = cv::KalmanFilter(4, 2, 0, CV_32F);
+
+    center_filter_.transitionMatrix = (cv::Mat_<float>(4, 4) << 1.0F, 0.0F, 1.0F, 0.0F,
+                                                                0.0F, 1.0F, 0.0F, 1.0F,
+                                                                0.0F, 0.0F, 1.0F, 0.0F,
+                                                                0.0F, 0.0F, 0.0F, 1.0F);
+    center_filter_.measurementMatrix = (cv::Mat_<float>(2, 4) << 1.0F, 0.0F, 0.0F, 0.0F,
+                                                                 0.0F, 1.0F, 0.0F, 0.0F);
+
+    cv::setIdentity(center_filter_.processNoiseCov, cv::Scalar(config_.kalman_process_noise));
+    cv::setIdentity(center_filter_.measurementNoiseCov, cv::Scalar(config_.kalman_measurement_noise));
+    cv::setIdentity(center_filter_.errorCovPost, cv::Scalar(config_.kalman_error_cov));
+
+    center_filter_.statePost.at<float>(0) = center.x;
+    center_filter_.statePost.at<float>(1) = center.y;
+    center_filter_.statePost.at<float>(2) = 0.0F;
+    center_filter_.statePost.at<float>(3) = 0.0F;
+    kalman_initialized_ = true;
+}
+
+cv::Point2f TargetTracker::correctCenter(const cv::Point2f& measurement_center) {
+    if (!kalman_initialized_) {
+        initializeKalman(measurement_center);
+    }
+
+    center_filter_.predict();
+
+    cv::Mat measurement(2, 1, CV_32F);
+    measurement.at<float>(0) = measurement_center.x;
+    measurement.at<float>(1) = measurement_center.y;
+
+    const cv::Mat corrected = center_filter_.correct(measurement);
+    return {corrected.at<float>(0), corrected.at<float>(1)};
+}
+
+cv::Point2f TargetTracker::predictCenter() {
+    if (!kalman_initialized_) {
+        return tracked_target_.has_value() ? tracked_target_->center : cv::Point2f{};
+    }
+
+    const cv::Mat prediction = center_filter_.predict();
+    return {prediction.at<float>(0), prediction.at<float>(1)};
+}
+
+BeaconTarget TargetTracker::withCenter(BeaconTarget target, const cv::Point2f& center) const {
+    target.bounding_rect.center = center;
+    target.center = center;
+    target.image_points = orderPoints(target.bounding_rect);
+    return target;
+}
+
 BeaconTarget TargetTracker::smoothTarget(const BeaconTarget& previous,
-                                         const BeaconTarget& measurement) const {
+                                         const BeaconTarget& measurement) {
     const double alpha = std::clamp(config_.smooth_alpha, 0.0, 1.0);
 
     BeaconTarget smoothed = measurement;
-    smoothed.bounding_rect.center = lerpPoint(previous.bounding_rect.center,
-                                             measurement.bounding_rect.center,
-                                             alpha);
+    smoothed.bounding_rect.center = correctCenter(measurement.bounding_rect.center);
     smoothed.bounding_rect.size = lerpSize(previous.bounding_rect.size,
                                           measurement.bounding_rect.size,
                                           alpha);

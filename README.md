@@ -8,7 +8,7 @@ RM_Gimbal_System_26 是一个面向 RoboMaster 云台视觉跟踪任务的 C++ �
 - 支持红色、蓝色信标检测，并可在运行时快速切换。
 - 基于颜色分割、轮廓筛选和几何约束提取信标灯块。
 - 显示原始候选框、稳定目标框、二值化 mask、PnP 位姿和控制状态。
-- 使用目标时序稳定模块降低检测框跳动对控制量的影响。
+- 使用目标时序稳定模块降低检测框跳动对控制量的影响，其中信标中心点 `(x, y)` 使用 Kalman 滤波，尺寸和角度使用一阶低通滤波。
 - 使用 PnP 解算目标相对相机的 yaw、pitch 和距离。
 - 提供 Tracking / Lost / Searching 控制状态。
 - 丢失目标后短时保持控制量，长时间丢失后进入小幅搜索模式。
@@ -27,7 +27,7 @@ RM_Gimbal_System_26 是一个面向 RoboMaster 云台视觉跟踪任务的 C++ �
 ├── include/
 │   ├── Camera.hpp                   # Galaxy/MER 相机封装
 │   ├── Detector.hpp                 # 信标检测接口
-│   ├── TargetTracker.hpp            # 目标时序稳定
+│   ├── TargetTracker.hpp            # 目标时序稳定，中心点 Kalman 滤波
 │   ├── Solver.hpp                   # PnP 位姿解算
 │   ├── Transform.hpp                # 坐标系转换
 │   ├── Controller.hpp               # 控制状态机接口
@@ -206,7 +206,8 @@ packet size: 29 bytes
 4. 运行 `gimbal_direction_test`，确认电控协议、mode 和 yaw/pitch 正方向。
 5. 运行 `RM_Gimbal_System_26`，先只看调试窗口，不打开串口。
 6. 调整 `Beacon Debug - Controls` 中的阈值、面积、矩形度、长宽比和控制参数。
-7. 确认检测框、PnP 结果和 `cmd_yaw/cmd_pitch` 连续稳定后，按 `u` 开启串口发送。
+7. 如果检测框仍有细小抖动，可继续微调 `TargetTrackerConfig` 中的 Kalman 参数。
+8. 确认检测框、PnP 结果和 `cmd_yaw/cmd_pitch` 连续稳定后，按 `u` 开启串口发送。
 
 ## 配置说明
 
@@ -224,6 +225,32 @@ solver_config.beacon_size_mm = cv::Size2f(50.0F, 67.0F);
 ```
 
 如果实际目标尺寸不同，需要同步修改该参数，否则 PnP 距离和角度会产生偏差。
+
+### 目标跟踪滤波参数
+
+`TargetTracker` 会对检测到的信标目标做时序稳定：
+
+- 中心点 `(x, y)` 使用 Kalman 滤波，状态量为 `[x, y, vx, vy]`。
+- 有有效检测时执行 `predict + correct`。
+- 短暂丢失目标时只执行 `predict`，继续输出预测中心点。
+- 信标尺寸和角度仍使用 `smooth_alpha` 做一阶低通滤波。
+
+相关参数在 `include/TargetTracker.hpp` 的 `TargetTrackerConfig` 中：
+
+```cpp
+double min_confidence{0.35};
+double smooth_alpha{0.35};
+double kalman_process_noise{1e-2};
+double kalman_measurement_noise{5e-1};
+double kalman_error_cov{1.0};
+int max_lost_frames{5};
+```
+
+调参建议：
+
+- 云台跟随明显变慢：适当增大 `kalman_process_noise`。
+- 检测框仍有明显抖动：适当增大 `kalman_measurement_noise`。
+- 目标快速移动时跟不上：降低 `kalman_measurement_noise`，或增大 `kalman_process_noise`。
 
 ## 常见问题
 
