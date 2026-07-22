@@ -1,5 +1,4 @@
 #include "Solver.hpp"
-
 #include <cmath>
 #include <utility>
 
@@ -25,9 +24,10 @@ std::optional<PoseResult> BallisticSolver::solve(const ArmorTarget& target) cons
         return std::nullopt;
     }
 
-    cv::Vec3d rotation_vector;
-    cv::Vec3d translation_vector;
-    // IPPE 适合平面矩形目标；这里把信标正面外框近似成一个 50mm x 67mm 平面。
+    // 使用 cv::Mat 接收 PnP 输出，避免 cv::Vec3d 强制转换断言失败
+    cv::Mat rotation_vector;
+    cv::Mat translation_vector;
+    
     const bool ok = cv::solvePnP(buildObjectPoints(),
                                  target.image_points,
                                  config_.calibration.camera_matrix,
@@ -40,14 +40,13 @@ std::optional<PoseResult> BallisticSolver::solve(const ArmorTarget& target) cons
         return std::nullopt;
     }
 
-    const double x_mm = translation_vector[0];
-    const double y_mm = translation_vector[1];
-    const double z_mm = translation_vector[2];
+    const double x_mm = translation_vector.at<double>(0);
+    const double y_mm = translation_vector.at<double>(1);
+    const double z_mm = translation_vector.at<double>(2);
 
-    // OpenCV 相机坐标系：x 向右，y 向下，z 向前。yaw/pitch 先在相机坐标系下计算。
     PoseResult result;
-    result.rotation_vector = rotation_vector;
-    result.translation_vector = translation_vector;
+    result.rotation_vector = rotation_vector.clone();
+    result.translation_vector = translation_vector.clone();
     result.distance_m = cv::norm(translation_vector) / 1000.0;
     result.yaw_deg = std::atan2(x_mm, z_mm) * kRadiansToDegrees;
 
@@ -56,8 +55,6 @@ std::optional<PoseResult> BallisticSolver::solve(const ArmorTarget& target) cons
     return result;
 }
 
-// 构造信标外框在目标坐标系下的四个 3D 点，顺序与 Detector 输出的图像点保持一致：
-// 左上、右上、右下、左下。
 std::vector<cv::Point3f> BallisticSolver::buildObjectPoints(bool large_armor) const {
     (void)large_armor;
 
@@ -72,12 +69,10 @@ std::vector<cv::Point3f> BallisticSolver::buildObjectPoints(bool large_armor) co
     };
 }
 
-// 标定完成后，主程序用这个接口把 camera_matrix 和 distortion_coeffs 注入解算器。
 void BallisticSolver::setCalibration(const CameraCalibration& calibration) {
     config_.calibration = calibration;
 }
 
-// 预留给后续弹道补偿或云台控制使用，目前信标跟踪阶段暂不依赖弹速。
 void BallisticSolver::setBulletSpeed(double speed_mps) noexcept {
     config_.bullet_speed_mps = speed_mps;
 }
@@ -95,7 +90,6 @@ double BallisticSolver::compensatePitch(double pitch_rad, double distance_m) con
         return pitch_rad;
     }
 
-    // 简化抛物线模型：根据飞行时间估算下坠角度，后续接弹丸时可再精细化。
     const double flight_time = distance_m / config_.bullet_speed_mps;
     const double drop_m = 0.5 * config_.gravity_mps2 * flight_time * flight_time;
     return pitch_rad + std::atan2(drop_m, distance_m);
