@@ -4,6 +4,7 @@
 #include <GxIAPI.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 #include <utility>
@@ -17,6 +18,45 @@ bool checkStatus(GX_STATUS status, const char* action) {
     }
 
     std::cerr << "[GalaxyCamera] " << action << " failed, status = " << status << std::endl;
+    return false;
+}
+
+void printLastError(const char* action) {
+    GX_STATUS last_error = GX_STATUS_SUCCESS;
+    char error_text[256]{};
+    size_t error_text_size = sizeof(error_text);
+    if (GXGetLastError(&last_error, error_text, &error_text_size) == GX_STATUS_SUCCESS) {
+        std::cerr << "[GalaxyCamera] " << action << " last error: "
+                  << last_error << ", " << error_text << std::endl;
+    }
+}
+
+bool openDeviceByIndex(uint32_t index, GX_DEV_HANDLE* handle) {
+    char index_text[16]{};
+    std::snprintf(index_text, sizeof(index_text), "%u", index);
+
+    GX_OPEN_PARAM open_param{};
+    open_param.pszContent = index_text;
+    open_param.openMode = GX_OPEN_INDEX;
+    open_param.accessMode = GX_ACCESS_EXCLUSIVE;
+
+    GX_STATUS status = GXOpenDevice(&open_param, handle);
+    if (status == GX_STATUS_SUCCESS) {
+        return true;
+    }
+
+    std::cerr << "[GalaxyCamera] GXOpenDevice EXCLUSIVE failed, status = " << status << std::endl;
+    printLastError("GXOpenDevice EXCLUSIVE");
+
+    open_param.accessMode = GX_ACCESS_CONTROL;
+    status = GXOpenDevice(&open_param, handle);
+    if (status == GX_STATUS_SUCCESS) {
+        std::cerr << "[GalaxyCamera] opened device with CONTROL access mode." << std::endl;
+        return true;
+    }
+
+    std::cerr << "[GalaxyCamera] GXOpenDevice CONTROL failed, status = " << status << std::endl;
+    printLastError("GXOpenDevice CONTROL");
     return false;
 }
 
@@ -127,8 +167,7 @@ bool Camera::open(const std::string& config_path) {
         return false;
     }
 
-    if (!checkStatus(GXOpenDeviceByIndex(1, reinterpret_cast<GX_DEV_HANDLE*>(&device_handle_)),
-                     "GXOpenDeviceByIndex")) {
+    if (!openDeviceByIndex(1, reinterpret_cast<GX_DEV_HANDLE*>(&device_handle_))) {
         return false;
     }
 

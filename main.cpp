@@ -3,7 +3,12 @@
 #include <string>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <optional>
 #include <opencv2/opencv.hpp>
 #include "Camera.hpp"
@@ -67,6 +72,176 @@ struct SerialDebugState {
     bool opened{false};
     bool last_send_ok{false};
     std::string message{"serial off"};
+};
+
+struct ResponseDebugState {
+    int yaw_response_ms{-1};
+    int pitch_response_ms{-1};
+    bool yaw_active{false};
+    bool pitch_active{false};
+};
+
+std::string trackingStateName(rm_gimbal::TrackingState state);
+
+std::string timestampForFile() {
+    const auto now = std::chrono::system_clock::now();
+    const std::time_t now_time = std::chrono::system_clock::to_time_t(now);
+    const std::tm local_time = *std::localtime(&now_time);
+
+    std::ostringstream text;
+    text << std::put_time(&local_time, "%Y%m%d_%H%M%S");
+    return text.str();
+}
+
+std::string responseText(int response_ms) {
+    if (response_ms < 0) {
+        return "--";
+    }
+    return std::to_string(response_ms) + "ms";
+}
+
+class ResponseAxisTracker {
+public:
+    ResponseAxisTracker(double start_threshold_deg,
+                        double stable_threshold_deg,
+                        int stable_frame_threshold)
+        : start_threshold_deg_(start_threshold_deg),
+          stable_threshold_deg_(stable_threshold_deg),
+          stable_frame_threshold_(stable_frame_threshold) {}
+
+    void update(const std::optional<double>& error_deg,
+                std::chrono::steady_clock::time_point now) {
+        if (!error_deg.has_value()) {
+            active_ = false;
+            stable_frames_ = 0;
+            return;
+        }
+
+        const double abs_error = std::abs(*error_deg);
+        if (!active_ && abs_error >= start_threshold_deg_) {
+            active_ = true;
+            stable_frames_ = 0;
+            start_time_ = now;
+        }
+
+        if (!active_) {
+            return;
+        }
+
+        if (abs_error <= stable_threshold_deg_) {
+            ++stable_frames_;
+        } else {
+            stable_frames_ = 0;
+        }
+
+        if (stable_frames_ >= stable_frame_threshold_) {
+            last_response_ms_ = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count());
+            active_ = false;
+            stable_frames_ = 0;
+        }
+    }
+
+    [[nodiscard]] int lastResponseMs() const noexcept {
+        return last_response_ms_;
+    }
+
+    [[nodiscard]] bool active() const noexcept {
+        return active_;
+    }
+
+private:
+    double start_threshold_deg_{5.0};
+    double stable_threshold_deg_{1.0};
+    int stable_frame_threshold_{10};
+    bool active_{false};
+    int stable_frames_{0};
+    int last_response_ms_{-1};
+    std::chrono::steady_clock::time_point start_time_{};
+};
+
+class ResponseTracker {
+public:
+    ResponseDebugState update(const std::optional<rm_gimbal::PoseResult>& pose,
+                              std::chrono::steady_clock::time_point now) {
+        const std::optional<double> yaw_error = pose.has_value()
+                                                    ? std::optional<double>(pose->yaw_deg)
+                                                    : std::nullopt;
+        const std::optional<double> pitch_error = pose.has_value()
+                                                      ? std::optional<double>(pose->pitch_deg)
+                                                      : std::nullopt;
+
+        yaw_.update(yaw_error, now);
+        pitch_.update(pitch_error, now);
+
+        ResponseDebugState state;
+        state.yaw_response_ms = yaw_.lastResponseMs();
+        state.pitch_response_ms = pitch_.lastResponseMs();
+        state.yaw_active = yaw_.active();
+        state.pitch_active = pitch_.active();
+        return state;
+    }
+
+private:
+    ResponseAxisTracker yaw_{5.0, 1.0, 10};
+    ResponseAxisTracker pitch_{5.0, 1.0, 10};
+};
+
+class TelemetryLogger {
+public:
+    TelemetryLogger() {
+        namespace fs = std::filesystem;
+        fs::create_directories("logs");
+        path_ = "logs/telemetry_" + timestampForFile() + ".csv";
+        file_.open(path_);
+        if (!file_.is_open()) {
+            std::cerr << "[Telemetry] 无法创建日志文件：" << path_ << std::endl;
+            return;
+        }
+
+        file_ << "time_ms,target_yaw_deg,target_pitch_deg,distance_m,"
+              << "cmd_yaw_deg,cmd_pitch_deg,state,control,fire,"
+              << "serial_on,serial_opened,send_ok,yaw_response_ms,pitch_response_ms\n";
+        std::cout << "[Telemetry] 日志记录到：" << path_ << std::endl;
+    }
+
+    void write(std::chrono::milliseconds elapsed,
+               const std::optional<rm_gimbal::PoseResult>& pose,
+               const ControlDebugState& control,
+               const SerialDebugState& serial,
+               const ResponseDebugState& response) {
+        if (!file_.is_open()) {
+            return;
+        }
+
+        file_ << elapsed.count() << ',';
+        if (pose.has_value()) {
+            file_ << pose->yaw_deg << ','
+                  << pose->pitch_deg << ','
+                  << pose->distance_m << ',';
+        } else {
+            file_ << ",,,";
+        }
+
+        file_ << control.command.yaw_deg << ','
+              << control.command.pitch_deg << ','
+              << trackingStateName(control.state) << ','
+              << (control.command.control ? 1 : 0) << ','
+              << (control.command.fire ? 1 : 0) << ','
+              << (serial.enabled ? 1 : 0) << ','
+              << (serial.opened ? 1 : 0) << ','
+              << (serial.last_send_ok ? 1 : 0) << ','
+              << response.yaw_response_ms << ','
+              << response.pitch_response_ms << '\n';
+    }
+
+    [[nodiscard]] const std::string& path() const noexcept {
+        return path_;
+    }
+
+private:
+    std::string path_{};
+    std::ofstream file_{};
 };
 
 // 画旋转矩形，分别用于显示单个灯块和最终信标外框。
@@ -281,7 +456,8 @@ cv::Mat makeDebugView(const cv::Mat& frame,
                       const ControlDebugState& control,
                       const SerialDebugState& serial_state,
                       const ControlStrategyConfig& control_config,
-                      const FixedTargetState& fixed_target) {
+                      const FixedTargetState& fixed_target,
+                      const ResponseDebugState& response_state) {
     cv::Mat view = frame.clone();
 
     // 黄色框：当前识别到的单个信标发光矩形块。
@@ -389,6 +565,19 @@ cv::Mat makeDebugView(const cv::Mat& frame,
                     cv::Scalar(180, 180, 255), 1, cv::LINE_AA);
     }
 
+    {
+        std::ostringstream response_line;
+        response_line << "response yaw=" << responseText(response_state.yaw_response_ms)
+                      << (response_state.yaw_active ? "*" : "")
+                      << " pitch=" << responseText(response_state.pitch_response_ms)
+                      << (response_state.pitch_active ? "*" : "")
+                      << " | key: p screenshot";
+        cv::putText(view, response_line.str(), cv::Point(16, 212), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
+        cv::putText(view, response_line.str(), cv::Point(16, 212), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    cv::Scalar(120, 255, 180), 1, cv::LINE_AA);
+    }
+
     if (coordinates.has_value()) {
         std::ostringstream camera_text;
         std::ostringstream gimbal_text;
@@ -409,7 +598,7 @@ cv::Mat makeDebugView(const cv::Mat& frame,
 
         const std::array<std::string, 3> lines{camera_text.str(), gimbal_text.str(), world_text.str()};
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            const cv::Point pos(16, static_cast<int>(212 + i * 28));
+            const cv::Point pos(16, static_cast<int>(242 + i * 28));
             cv::putText(view, lines[i], pos, cv::FONT_HERSHEY_SIMPLEX, 0.55,
                         cv::Scalar(255, 255, 255), 3, cv::LINE_AA);
             cv::putText(view, lines[i], pos, cv::FONT_HERSHEY_SIMPLEX, 0.55,
@@ -458,9 +647,12 @@ int main(int argc, char** argv) {
     rm_gimbal::EnemyColor enemy_color = rm_gimbal::EnemyColor::Blue;
     TrackbarState trackbars;
     createControlWindow(trackbars);
+    ResponseTracker response_tracker;
+    TelemetryLogger telemetry_logger;
+    const auto telemetry_start_time = std::chrono::steady_clock::now();
 
     cv::Mat frame;
-    std::cout << "进入信标检测调试界面：按 r 检测红色，按 b 检测蓝色，按 u 开关串口发送，按 q 或 Esc 退出。"
+    std::cout << "进入信标检测调试界面：按 r 检测红色，按 b 检测蓝色，按 u 开关串口发送，按 p 保存截图，按 q 或 Esc 退出。"
               << std::endl;
     std::cout << "串口默认：" << serial_debug.port << " @ " << serial_debug.baud_rate
               << "，也可使用 ./build/RM_Gimbal_System_26 /dev/ttyUSB0 115200 指定。" << std::endl;
@@ -506,11 +698,16 @@ int main(int argc, char** argv) {
             serial_debug.message = serial_debug.last_send_ok ? "send ok" : "send failed";
         }
 
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - telemetry_start_time);
+        const ResponseDebugState response_state = response_tracker.update(pose, now);
+        telemetry_logger.write(elapsed, pose, control_debug, serial_debug, response_state);
+
         // 7. 显示调试画面和二值化 mask。
         const cv::Mat debug_view = makeDebugView(frame, debug, enemy_color, config,
                                                  stable_target, tracker.lostFrames(),
                                                  pose, coordinates, control_debug, serial_debug,
-                                                 control_config, fixed_target);
+                                                 control_config, fixed_target, response_state);
 
         cv::imshow(kFrameWindow, debug_view);
         cv::imshow(kMaskWindow, debug.mask);
@@ -559,6 +756,14 @@ int main(int argc, char** argv) {
             std::cout << "固定角度测试模式：" << (fixed_target.enabled ? "开启" : "关闭")
                       << "，yaw=" << fixed_target.yaw_deg
                       << " deg, pitch=" << fixed_target.pitch_deg << " deg" << std::endl;
+        } else if (key == 'p' || key == 'P') {
+            std::filesystem::create_directories("logs");
+            const std::string screenshot_path = "logs/screenshot_" + timestampForFile() + ".png";
+            if (cv::imwrite(screenshot_path, debug_view)) {
+                std::cout << "调试截图已保存：" << screenshot_path << std::endl;
+            } else {
+                std::cerr << "调试截图保存失败：" << screenshot_path << std::endl;
+            }
         }
     }
 
