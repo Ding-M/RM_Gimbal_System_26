@@ -118,6 +118,31 @@ build/serial_loopback_test     # 串口回环测试工具
 
 程序启动后默认不发送串口控制量。确认视觉结果和控制量正常后，再按 `u` 打开串口发送。
 
+### PlotJuggler 实时遥测
+
+主程序会通过 UDP 向本机发送实时遥测数据，默认地址为：
+
+```text
+127.0.0.1:9870
+```
+
+这条 UDP 链路只用于调试曲线，不会占用云台控制串口。PlotJuggler 中打开 UDP Server，端口填写 `9870`，数据格式选择 JSON，然后启动主程序即可实时看到字段。
+
+常用字段：
+
+- `target_yaw_deg`
+- `cmd_yaw_deg`
+- `cmd_yaw_inverted_deg`
+- `target_pitch_deg`
+- `cmd_pitch_deg`
+- `distance_m`
+- `serial_on`
+- `send_ok`
+- `yaw_response_ms`
+- `pitch_response_ms`
+
+Yaw 方向上，主程序发送给电控前会对 yaw 命令取反。如果希望和目标 yaw 同方向对比，PlotJuggler 中建议绘制 `target_yaw_deg` 和 `cmd_yaw_inverted_deg`。
+
 ## 相机标定
 
 标定工具默认使用 `10 x 7` 对称圆点板，圆心间距为 `15mm`，标定结果会写入 `config/camera_params.yaml`：

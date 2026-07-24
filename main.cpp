@@ -10,6 +10,11 @@
 #include <fstream>
 #include <iomanip>
 #include <optional>
+#include <cerrno>
+#include <cstring>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 #include <opencv2/opencv.hpp>
 #include "Camera.hpp"
 #include "Controller.hpp"
@@ -242,6 +247,94 @@ public:
 private:
     std::string path_{};
     std::ofstream file_{};
+};
+
+class UdpTelemetryPublisher {
+public:
+    UdpTelemetryPublisher(const std::string& host = "127.0.0.1", uint16_t port = 9870) {
+        fd_ = ::socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd_ < 0) {
+            std::cerr << "[UDP Telemetry] socket 创建失败：" << std::strerror(errno) << std::endl;
+            return;
+        }
+
+        destination_.sin_family = AF_INET;
+        destination_.sin_port = htons(port);
+        if (::inet_pton(AF_INET, host.c_str(), &destination_.sin_addr) != 1) {
+            std::cerr << "[UDP Telemetry] 无效目标地址：" << host << std::endl;
+            close();
+            return;
+        }
+
+        std::cout << "[UDP Telemetry] 实时遥测输出到 " << host << ":" << port << std::endl;
+    }
+
+    ~UdpTelemetryPublisher() {
+        close();
+    }
+
+    UdpTelemetryPublisher(const UdpTelemetryPublisher&) = delete;
+    UdpTelemetryPublisher& operator=(const UdpTelemetryPublisher&) = delete;
+
+    void publish(std::chrono::milliseconds elapsed,
+                 const std::optional<rm_gimbal::PoseResult>& pose,
+                 const ControlDebugState& control,
+                 const SerialDebugState& serial,
+                 const ResponseDebugState& response) const {
+        if (fd_ < 0) {
+            return;
+        }
+
+        std::ostringstream json;
+        json << std::fixed << std::setprecision(4)
+             << "{"
+             << "\"time_ms\":" << elapsed.count() << ','
+             << "\"target_yaw_deg\":";
+        if (pose.has_value()) {
+            json << pose->yaw_deg
+                 << ",\"target_pitch_deg\":" << pose->pitch_deg
+                 << ",\"distance_m\":" << pose->distance_m;
+        } else {
+            json << "null,\"target_pitch_deg\":null,\"distance_m\":null";
+        }
+
+        json << ",\"cmd_yaw_deg\":" << control.command.yaw_deg
+             << ",\"cmd_yaw_inverted_deg\":" << -control.command.yaw_deg
+             << ",\"cmd_pitch_deg\":" << control.command.pitch_deg
+             << ",\"state\":\"" << trackingStateName(control.state) << "\""
+             << ",\"control\":" << (control.command.control ? 1 : 0)
+             << ",\"fire\":" << (control.command.fire ? 1 : 0)
+             << ",\"serial_on\":" << (serial.enabled ? 1 : 0)
+             << ",\"serial_opened\":" << (serial.opened ? 1 : 0)
+             << ",\"send_ok\":" << (serial.last_send_ok ? 1 : 0)
+             << ",\"yaw_response_ms\":" << response.yaw_response_ms
+             << ",\"pitch_response_ms\":" << response.pitch_response_ms
+             << "}\n";
+
+        const std::string payload = json.str();
+        const ssize_t sent = ::sendto(fd_,
+                                      payload.data(),
+                                      payload.size(),
+                                      MSG_DONTWAIT,
+                                      reinterpret_cast<const sockaddr*>(&destination_),
+                                      sizeof(destination_));
+        if (sent < 0 && !printed_send_error_) {
+            std::cerr << "[UDP Telemetry] sendto 失败：" << std::strerror(errno) << std::endl;
+            printed_send_error_ = true;
+        }
+    }
+
+private:
+    void close() {
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+    }
+
+    int fd_{-1};
+    sockaddr_in destination_{};
+    mutable bool printed_send_error_{false};
 };
 
 // 画旋转矩形，分别用于显示单个灯块和最终信标外框。
@@ -649,6 +742,7 @@ int main(int argc, char** argv) {
     createControlWindow(trackbars);
     ResponseTracker response_tracker;
     TelemetryLogger telemetry_logger;
+    UdpTelemetryPublisher udp_telemetry;
     const auto telemetry_start_time = std::chrono::steady_clock::now();
 
     cv::Mat frame;
@@ -702,6 +796,7 @@ int main(int argc, char** argv) {
         const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - telemetry_start_time);
         const ResponseDebugState response_state = response_tracker.update(pose, now);
         telemetry_logger.write(elapsed, pose, control_debug, serial_debug, response_state);
+        udp_telemetry.publish(elapsed, pose, control_debug, serial_debug, response_state);
 
         // 7. 显示调试画面和二值化 mask。
         const cv::Mat debug_view = makeDebugView(frame, debug, enemy_color, config,
